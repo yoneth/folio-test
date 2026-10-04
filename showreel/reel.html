@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motion Reel 2026</title>
+<style>
+  @font-face { font-family: 'Archivo Black'; src: url(fonts/ArchivoBlack.woff2) format('woff2'); font-display: block; }
+  @font-face { font-family: 'Space Grotesk'; src: url(fonts/SpaceGrotesk.woff2) format('woff2'); font-weight: 300 700; font-display: block; }
+  @font-face { font-family: 'JetBrains Mono'; src: url(fonts/JetBrainsMono.woff2) format('woff2'); font-weight: 500; font-display: block; }
+  @font-face { font-family: 'Instrument Serif'; src: url(fonts/InstrumentSerif-Italic.woff2) format('woff2'); font-style: italic; font-display: block; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: absolute; inset: 0; margin: auto; width: 100vw; height: 56.25vw; max-height: 100vh; max-width: 177.78vh; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+/* ------------------------------------------------------------------------
+   MOTION REEL 2026 — a 15s showreel.
+   Every pixel is a pure function of time t, so any frame can be rendered
+   in any order (parallel rendering) and sub-frames can be accumulated for
+   true shutter motion blur. 120 BPM: one beat = 0.5s, 30 beats total.
+   ------------------------------------------------------------------------ */
+const W = 1920, H = 1080, CX = W / 2, CY = H / 2, FPS = 60, DUR = 15;
+const TAU = Math.PI * 2;
+const COL = { ink: '#0B0B0E', paper: '#F2EEE5', red: '#FF3D1F', blue: '#2D4BFF', lime: '#D4FF3A' };
+const F = { display: '"Archivo Black"', mono: '"JetBrains Mono"', serif: '"Instrument Serif"', grotesk: '"Space Grotesk"' };
+
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const ease = {
+  lin: x => x,
+  inQuad: x => x * x,
+  outQuad: x => 1 - (1 - x) * (1 - x),
+  inCubic: x => x * x * x,
+  outCubic: x => 1 - (1 - x) ** 3,
+  inOutCubic: x => x < .5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2,
+  inQuart: x => x ** 4,
+  outQuart: x => 1 - (1 - x) ** 4,
+  inOutQuart: x => x < .5 ? 8 * x ** 4 : 1 - (-2 * x + 2) ** 4 / 2,
+  outQuint: x => 1 - (1 - x) ** 5,
+  inExpo: x => x === 0 ? 0 : 2 ** (10 * x - 10),
+  outExpo: x => x === 1 ? 1 : 1 - 2 ** (-10 * x),
+  inOutExpo: x => x === 0 ? 0 : x === 1 ? 1 : x < .5 ? 2 ** (20 * x - 10) / 2 : (2 - 2 ** (-20 * x + 10)) / 2,
+  outBack: (x, s = 1.70158) => 1 + (s + 1) * (x - 1) ** 3 + s * (x - 1) ** 2,
+  outElastic: x => x === 0 ? 0 : x === 1 ? 1 : 2 ** (-10 * x) * Math.sin((x * 10 - .75) * TAU / 3) + 1,
+};
+function rng(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const font = (px, fam, style = '') => `${style} ${px}px ${fam}`;
+const qt = t => Math.round(t * FPS) / FPS; // quantise to frame (crisp readouts under motion blur)
+
+/* ---------- canvases ---------- */
+const cv = document.getElementById('c');
+const out = cv.getContext('2d');
+const mk = (opts) => { const c = document.createElement('canvas'); c.width = W; c.height = H; return [c, c.getContext('2d', opts)]; };
+const [sceneCv, sg] = mk();
+const [auxCv, ag] = mk({ willReadFrequently: true });
+
+/* ---------- text layout cache ---------- */
+const layoutCache = new Map();
+function layout(text, size, fam, style = '') {
+  const key = text + '|' + size + '|' + fam + style;
+  if (layoutCache.has(key)) return layoutCache.get(key);
+  ag.font = font(size, fam, style);
+  const ch = [...text], xs = [];
+  for (let i = 0; i < ch.length; i++) xs.push(ag.measureText(ch.slice(0, i).join('')).width);
+  const m = ag.measureText(text);
+  const capH = ag.measureText('H').actualBoundingBoxAscent;
+  const L = { ch, xs, w: m.width, capH };
+  layoutCache.set(key, L);
+  return L;
+}
+
+/* ---------- physics: ballistic bounce track ---------- */
+// Falls from y0 at t0 so that it hits `ground` at imps[0], then bounces with
+// constant gravity g between successive impact times (heights follow g*T^2/8).
+function track(t, c) {
+  const g = c.g, imps = c.imps;
+  if (t < c.t0) return { y: c.y0, vy: 0, pre: true };
+  if (t < imps[0]) {
+    const T = imps[0] - c.t0, D = c.ground - c.y0, v0 = (D - .5 * g * T * T) / T, u = t - c.t0;
+    return { y: c.y0 + v0 * u + .5 * g * u * u, vy: v0 + g * u };
+  }
+  for (let k = 0; k < imps.length - 1; k++) if (t < imps[k + 1]) {
+    const T = imps[k + 1] - imps[k], u = t - imps[k];
+    return { y: c.ground - (g * T / 2) * u + .5 * g * u * u, vy: -g * T / 2 + g * u };
+  }
+  return { y: c.ground, vy: 0, rest: true };
+}
+function impactSquash(t, imps, str, w = .055) {
+  let q = 0;
+  imps.forEach((ti, k) => { const d = Math.abs(t - ti); if (d < w) q = Math.max(q, str[k] * (1 - d / w) ** 2); });
+  return q;
+}
+
+/* ======================================================================
+   SCENE 1 (0–2s) — SQUASH & STRETCH. A ball drops, bounces on the 8ths
+   and 16ths, anticipates, launches, and swallows the frame.
+   ====================================================================== */
+const S1C = { floor: 760, R: 64, t0: .15, y0: -150, imps: [.5, 1.0, 1.25, 1.375], g: 9600, str: [1, .8, .5, .3] };
+function ball1(t) {
+  const { floor, R } = S1C;
+  const tr = track(t, { t0: S1C.t0, y0: S1C.y0, ground: floor - R, imps: S1C.imps, g: S1C.g });
+  let y = tr.y, sy = 1, r = R;
+  if (t < 1.375) {
+    sy = 1 + clamp(Math.abs(tr.vy) / 5200, 0, .34);
+    const q = impactSquash(t, S1C.imps, S1C.str);
+    if (q > .03) { sy = 1 - .5 * q; y = floor - R * sy; }
+    else y = Math.min(y, floor - R * sy);
+  } else if (t < 1.6) {
+    const a = ease.inOutCubic(prog(t, 1.42, 1.6));
+    sy = 1 - .42 * a; y = floor - R * sy;
+  } else {
+    const l = prog(t, 1.6, 1.82);
+    sy = lerp(.58, 1.5, ease.outExpo(prog(t, 1.6, 1.65)));
+    sy = lerp(sy, 1, ease.outCubic(prog(t, 1.65, 1.82)));
+    y = lerp(floor - R * .58, CY, ease.outQuart(l));
+    r = R * lerp(1, 18.6, ease.inExpo(prog(t, 1.76, 1.98)));
+  }
+  return { x: CX, y, sx: 1 / sy, sy, r, vy: tr.vy };
+}
+function S1(g, t) {
+  g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+  const { floor } = S1C;
+  // ruler floor
+  const grow = ease.outExpo(prog(t, .02, .7));
+  const fade = 1 - prog(t, 1.62, 1.8);
+  g.globalAlpha = .32 * fade;
+  g.fillStyle = COL.paper;
+  g.fillRect(CX - 640 * grow, floor, 1280 * grow, 2);
+  for (let x = -640; x <= 640; x += 32) {
+    if (Math.abs(x) > 640 * grow) continue;
+    const big = x % 160 === 0;
+    g.globalAlpha = (big ? .35 : .16) * fade;
+    g.fillRect(CX + x, floor + 10, 2, big ? 18 : 9);
+  }
+  g.globalAlpha = 1;
+
+  // impact rings + dust
+  S1C.imps.forEach((ti, k) => {
+    const p = prog(t, ti, ti + .6), s = S1C.str[k];
+    if (p <= 0 || p >= 1) return;
+    const rx = 64 + 460 * ease.outExpo(p) * s;
+    g.strokeStyle = COL.paper; g.globalAlpha = (1 - p) * .7 * s; g.lineWidth = 2;
+    g.beginPath(); g.ellipse(CX, floor, rx, rx * .14, 0, 0, TAU); g.stroke();
+    const rr = rng(100 + k);
+    for (let m = 0; m < 12; m++) {
+      const a = Math.PI + (m + .5) / 12 * Math.PI, sp = (260 + rr() * 420) * s;
+      const u = (t - ti);
+      const dx = Math.cos(a) * sp * u * 1.6, dy = Math.sin(a) * sp * u + 1400 * u * u;
+      if (dy > 4) continue;
+      g.globalAlpha = (1 - p) * s;
+      g.fillStyle = m % 3 === 0 ? COL.red : COL.paper;
+      g.fillRect(CX + dx, floor + dy - 3, 5, 5);
+    }
+  });
+  g.globalAlpha = 1;
+
+  // onion skins
+  for (let k = 8; k >= 1; k--) {
+    const tk = t - k * .032;
+    if (tk < .17 || tk > 1.6) continue;
+    const b = ball1(tk);
+    g.save(); g.globalAlpha = .38 * (1 - k / 9); g.strokeStyle = COL.paper; g.lineWidth = 2;
+    g.translate(b.x, b.y); g.scale(b.sx, b.sy);
+    g.beginPath(); g.arc(0, 0, b.r, 0, TAU); g.restore(); g.stroke();
+  }
+
+  // the ball
+  const b = ball1(t);
+  g.save(); g.translate(b.x, b.y); g.scale(b.sx, b.sy);
+  g.fillStyle = COL.red; g.beginPath(); g.arc(0, 0, b.r, 0, TAU); g.fill(); g.restore();
+
+  // live spec readout
+  const tq = qt(t);
+  if (tq > .2 && tq < 1.6) {
+    const bq = ball1(tq);
+    const lx = bq.x + 170, ly = bq.y - 120;
+    g.globalAlpha = prog(tq, .2, .3) * (1 - prog(tq, 1.5, 1.6));
+    g.strokeStyle = COL.paper; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(bq.x + 54, bq.y - 40); g.lineTo(lx - 20, ly + 12); g.lineTo(lx + 230, ly + 12); g.stroke();
+    g.fillStyle = COL.paper; g.font = font(17, F.mono); g.textAlign = 'left';
+    g.fillText(`SCALE.Y  ${bq.sy.toFixed(2)}`, lx, ly - 30);
+    g.fillText(`SCALE.X  ${bq.sx.toFixed(2)}`, lx, ly - 4);
+    g.globalAlpha = .55;
+    g.fillText(`VEL.Y    ${Math.round(bq.vy || 0)}`, lx, ly + 40);
+    g.globalAlpha = 1;
+  }
+}
+
+/* ======================================================================
+   SCENE 2 (2–4s) — KINETIC TYPE. One word per beat, whip-panel cuts,
+   then the frame slices apart into the grid.
+   ====================================================================== */
+const WORDS = [
+  { w: 'I', bg: COL.red, fg: COL.ink, note: '(pronoun)' },
+  { w: 'MAKE', bg: COL.ink, fg: COL.paper, note: '(verb)' },
+  { w: 'THINGS', bg: COL.paper, fg: COL.ink, note: '(noun, plural)' },
+  { w: 'MOVE.', bg: COL.blue, fg: COL.lime, note: '(verb, imperative)' },
+];
+function wordSize(word) {
+  const L = layout(word, 100, F.display);
+  return Math.min(860, Math.floor(100 * 1540 / L.w));
+}
+function wordScene(g, i, lt) {
+  const Wd = WORDS[i];
+  g.fillStyle = Wd.bg; g.fillRect(0, 0, W, H);
+  const size = wordSize(Wd.w), L = layout(Wd.w, size, F.display);
+  const s = lerp(1.16, 1, ease.outCubic(clamp(lt / .5)));
+  g.save();
+  g.translate(CX, CY); g.scale(s, s); g.translate(-CX, -CY);
+  const x0 = CX - L.w / 2, base = CY + L.capH / 2;
+  g.save();
+  g.beginPath(); g.rect(0, base - L.capH - size * .3, W, L.capH + size * .34); g.clip();
+  g.font = font(size, F.display); g.textAlign = 'left'; g.fillStyle = Wd.fg;
+  L.ch.forEach((c, j) => {
+    const p = ease.outExpo(clamp((lt - j * .038) / .34));
+    let yo = (1 - p) * size * .95, rot = 0;
+    if (i === 3) { // MOVE. — letters hop in a travelling wave
+      const h = clamp((lt - .16 - j * .045) / .2);
+      yo -= Math.sin(h * Math.PI) * 90;
+      rot = -Math.sin(h * Math.PI) * .12;
+    }
+    const lx = x0 + L.xs[j];
+    g.save(); g.translate(lx, base + yo); g.rotate(rot); g.fillText(c, 0, 0); g.restore();
+  });
+  g.restore();
+  // dictionary note
+  const na = ease.outCubic(prog(lt, .1, .32));
+  g.globalAlpha = na * .9; g.fillStyle = Wd.fg; g.font = font(58, F.serif, 'italic'); g.textAlign = 'right';
+  g.fillText(Wd.note, x0 + L.w, base + 92 + (1 - na) * 24);
+  g.globalAlpha = 1; g.textAlign = 'left';
+  g.restore();
+  // whip panel into next word (lands exactly on the next beat)
+  if (i < 3) {
+    const pp = prog(lt, .41, .5);
+    if (pp > 0) { const hh = H * ease.inQuart(pp); g.fillStyle = WORDS[i + 1].bg; g.fillRect(0, H - hh, W, hh); }
+  }
+}
+function S2(g, t) {
+  const i = Math.min(3, Math.floor((t - 2) / .5)), lt = t - 2 - i * .5;
+  if (t < 3.82) { wordScene(g, i, lt); return; }
+  // slice transition: strips fly apart revealing the grid
+  S3(g, t);
+  const n = 8, sh = H / n;
+  for (let k = 0; k < n; k++) {
+    const p = ease.inQuart(prog(t, 3.82 + k * .012, 3.99));
+    const dir = k % 2 ? 1 : -1;
+    g.save(); g.beginPath(); g.rect(0, k * sh, W, sh + 1); g.clip();
+    g.translate(dir * W * 1.06 * p, 0);
+    wordScene(g, 3, lt);
+    g.restore();
+  }
+}
+
+/* ======================================================================
+   SCENE 3 (4–6s) — SYSTEMS. A 16x9 grid of shapes; every beat a wave
+   ripples through, morphing circle <-> diamond and cycling colour. Then
+   it collapses into a vortex and an iris inverts the world.
+   ====================================================================== */
+const GC = 16, GR = 9, CELL = 120;
+const WAVES = [{ t: 4.0, x: CX, y: CY }, { t: 4.5, x: 0, y: 0 }, { t: 5.0, x: W, y: H }, { t: 5.5, x: CX, y: CY }];
+const GRID_COLS = [COL.ink, COL.red, COL.blue];
+function gridPos(i, j, t) {
+  const x = (i + .5) * CELL, y = (j + .5) * CELL;
+  const sw = ease.inCubic(prog(t, 5.62, 6.5));
+  if (sw <= 0) return [x, y];
+  const dx = x - CX, dy = y - CY, d = Math.hypot(dx, dy);
+  const a = Math.atan2(dy, dx) + sw * (2.6 - d / 900);
+  const rr = d * (1 - .45 * sw);
+  return [CX + Math.cos(a) * rr, CY + Math.sin(a) * rr];
+}
+function gridCell(i, j, t) {
+  const x0 = (i + .5) * CELL, y0 = (j + .5) * CELL;
+  let k = 0, bump = 0;
+  for (const w of WAVES) {
+    const d = Math.hypot(x0 - w.x, y0 - w.y);
+    const p = clamp((t - w.t - d / 2700) / .36);
+    k += ease.outBack(p, 2.4);
+    bump += Math.sin(Math.PI * p);
+  }
+  let size = 60 + 34 * bump;
+  let round = (1 + Math.cos(Math.PI * k)) / 2;
+  const sh = ease.inOutCubic(prog(t, 5.6, 5.92));
+  size = lerp(size, 12, sh); round = lerp(round, 1, sh);
+  const [x, y] = gridPos(i, j, t);
+  return { x, y, size, rot: k * Math.PI / 4, round, col: GRID_COLS[((Math.round(k) % 3) + 3) % 3] };
+}
+function drawGrid(g, t, override) {
+  for (let j = 0; j < GR; j++) for (let i = 0; i < GC; i++) {
+    const c = gridCell(i, j, t);
+    g.save(); g.translate(c.x, c.y); g.rotate(c.rot);
+    g.fillStyle = override || c.col;
+    const s = c.size, r = (s / 2) * c.round;
+    g.beginPath(); g.roundRect(-s / 2, -s / 2, s, s, r); g.fill();
+    g.restore();
+  }
+}
+function S3(g, t) {
+  g.fillStyle = COL.paper; g.fillRect(0, 0, W, H);
+  drawGrid(g, t);
+  const ir = 1160 * ease.inQuart(prog(t, 5.72, 6.0));
+  if (ir > 0) {
+    g.save(); g.beginPath(); g.arc(CX, CY, ir, 0, TAU); g.clip();
+    g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+    drawGrid(g, t, COL.paper);
+    g.restore();
+  }
+}
+
+/* ======================================================================
+   SCENE 4 (6–9s) — PARTICLES. The grid's dots become 2,200 particles:
+   sphere -> torus -> the word MOTION -> explosion.
+   ====================================================================== */
+const NP = 2200;
+let P = null;
+function initParticles() {
+  const r = rng(7);
+  // sample "MOTION" glyph pixels
+  ag.clearRect(0, 0, W, H);
+  const L = layout('MOTION', 100, F.display);
+  const size = Math.floor(100 * 1240 / L.w), L2 = layout('MOTION', size, F.display);
+  ag.font = font(size, F.display); ag.fillStyle = '#fff'; ag.textAlign = 'left';
+  ag.fillText('MOTION', CX - L2.w / 2, CY + L2.capH / 2);
+  const img = ag.getImageData(0, 0, W, H).data, pts = [];
+  for (let y = 0; y < H; y += 3) for (let x = 0; x < W; x += 3) if (img[(y * W + x) * 4 + 3] > 128) pts.push([x, y]);
+  ag.clearRect(0, 0, W, H);
+  // shuffle pts deterministically
+  for (let i = pts.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [pts[i], pts[j]] = [pts[j], pts[i]]; }
+  P = [];
+  for (let p = 0; p < NP; p++) {
+    const y = 1 - (p + .5) / NP * 2, rad = Math.sqrt(1 - y * y), th = p * 2.399963;
+    const sphere = [Math.cos(th) * rad * 330, y * 330, Math.sin(th) * rad * 330];
+    const u = Math.floor(p / 20) / (NP / 20) * TAU, v = (p % 20) / 20 * TAU + u * 3;
+    const torus = [(290 + 110 * Math.cos(v)) * Math.cos(u), 110 * Math.sin(v), (290 + 110 * Math.cos(v)) * Math.sin(u)];
+    const tp = pts[p % pts.length];
+    const c = p % (GC * GR);
+    const roll = r();
+    P.push({
+      sphere, torus, text: [tp[0] + (r() - .5) * 2, tp[1] + (r() - .5) * 2],
+      gi: c % GC, gj: Math.floor(c / GC),
+      jit: [(r() - .5) * 2, (r() - .5) * 2],
+      dl: r(), size: 2.2 + r() * 1.8,
+      col: roll < .13 ? COL.red : roll < .19 ? COL.lime : COL.paper,
+      dir: r() * TAU, sp: .6 + r(),
+    });
+  }
+  // draw order: paper first, accents on top
+  P.sort((a, b) => (a.col === COL.paper ? 0 : 1) - (b.col === COL.paper ? 0 : 1));
+}
+function project(v, ry, rx) {
+  const [x, y, z] = v;
+  const x1 = x * Math.cos(ry) + z * Math.sin(ry), z1 = -x * Math.sin(ry) + z * Math.cos(ry);
+  const y1 = y * Math.cos(rx) - z1 * Math.sin(rx), z2 = y * Math.sin(rx) + z1 * Math.cos(rx);
+  const k = 1100 / (1100 + z2);
+  return [CX + x1 * k, CY + y1 * k, k];
+}
+function S4(g, t) {
+  g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+  const ry = (t - 6) * 1.25, rxS = .32 + .12 * Math.sin(t * 1.3), rxT = 1.05;
+
+  // orbit decoration
+  const oa = prog(t, 6.4, 6.8) * (1 - prog(t, 7.85, 8.05));
+  if (oa > 0) {
+    g.save(); g.translate(CX, CY); g.rotate(-.28); g.globalAlpha = oa;
+    g.strokeStyle = COL.red; g.lineWidth = 1.5; g.beginPath(); g.ellipse(0, 0, 500, 120, 0, 0, TAU); g.stroke();
+    const sa = t * 2.6; g.fillStyle = COL.red; g.beginPath(); g.arc(Math.cos(sa) * 500, Math.sin(sa) * 120, 9, 0, TAU); g.fill();
+    g.rotate(.62); g.globalAlpha = oa * .35; g.strokeStyle = COL.paper; g.setLineDash([4, 10]);
+    g.beginPath(); g.ellipse(0, 0, 560, 90, 0, 0, TAU); g.stroke(); g.setLineDash([]);
+    g.restore();
+  }
+
+  // blue iris into scene 5 (under the particles)
+  const ir = 1160 * ease.inExpo(prog(t, 8.82, 9.0));
+  if (ir > 0) { g.fillStyle = COL.blue; g.beginPath(); g.arc(CX, CY, ir, 0, TAU); g.fill(); }
+
+  const ex = ease.inExpo(prog(t, 8.74, 9.0));
+  for (const q of P) {
+    const a = ease.inOutCubic(prog(t, 6.0 + q.dl * .3, 6.62 + q.dl * .3));
+    const b = ease.inOutCubic(prog(t, 7.15 + q.dl * .25, 7.72 + q.dl * .25));
+    const c = ease.inOutQuart(prog(t, 7.9 + q.dl * .28, 8.42 + q.dl * .28));
+    const gp = gridPos(q.gi, q.gj, t), jt = 9 * prog(t, 6, 6.5);
+    const sp = project(q.sphere, ry, rxS), tp = project(q.torus, ry + .5, rxT);
+    let x = gp[0] + q.jit[0] * jt, y = gp[1] + q.jit[1] * jt, k = 1, sz = 11;
+    x = lerp(x, sp[0], a); y = lerp(y, sp[1], a); k = lerp(1, sp[2], a); sz = lerp(sz, q.size * sp[2], a);
+    x = lerp(x, tp[0], b); y = lerp(y, tp[1], b); k = lerp(k, tp[2], b); sz = lerp(sz, q.size * tp[2], b);
+    x = lerp(x, q.text[0], c); y = lerp(y, q.text[1], c); k = lerp(k, 1, c); sz = lerp(sz, 4.6, c);
+    if (ex > 0) {
+      x += (x - CX) * ex * 2.4 + Math.cos(q.dir) * q.sp * 700 * ex;
+      y += (y - CY) * ex * 2.4 + Math.sin(q.dir) * q.sp * 700 * ex;
+    }
+    const depth = clamp((k - .76) / .5);
+    g.globalAlpha = lerp(1, lerp(.3, 1, depth), clamp(a + b) * (1 - c));
+    g.fillStyle = a < .5 ? COL.paper : q.col;
+    g.fillRect(x - sz / 2, y - sz / 2, sz, sz);
+  }
+  g.globalAlpha = 1;
+
+  // readout
+  const tq = qt(t);
+  const phase = tq < 6.6 ? 'GRID' : tq < 7.5 ? 'SPHERE' : tq < 8.2 ? 'TORUS' : 'TYPE';
+  g.globalAlpha = prog(tq, 6.2, 6.4) * (1 - prog(tq, 8.7, 8.8)) * .7;
+  g.fillStyle = COL.paper; g.font = font(17, F.mono); g.textAlign = 'center';
+  g.fillText(`N = ${NP}   ·   TARGET → ${phase}`, CX, 948);
+  g.textAlign = 'left'; g.globalAlpha = 1;
+}
+
+/* ======================================================================
+   SCENE 5 (9–11s) — TIMING. Three easings, side by side, with their
+   value graphs drawing live like a graph editor.
+   ====================================================================== */
+const LANES = [
+  { name: 'LINEAR', f: ease.lin, y: 520, col: COL.paper },
+  { name: 'EASE IN-OUT', f: ease.inOutCubic, y: 690, col: COL.paper },
+  { name: 'ELASTIC OUT', f: ease.outElastic, y: 860, col: COL.lime },
+];
+const TX0 = 560, TX1 = 1180, GX = 1490, GW = 250, GH = 96;
+const laneU = t => [prog(t, 9.3, 10.3), prog(t, 10.42, 10.92)];
+const laneV = (f, t) => { const [u1, u2] = laneU(t); return f(u1) - f(u2); };
+function S5(g, t) {
+  g.fillStyle = COL.blue; g.fillRect(0, 0, W, H);
+  const lt = t - 9;
+  // kicker + title
+  g.fillStyle = COL.lime; g.font = font(18, F.mono); g.textAlign = 'left';
+  g.globalAlpha = ease.outCubic(prog(lt, .02, .2));
+  g.fillText('THE GRAPH EDITOR  /  F(T) → VALUE', 200, 196);
+  g.globalAlpha = 1;
+  const title = 'timing is everything.';
+  const TL = layout(title, 128, F.serif, 'italic');
+  g.font = font(128, F.serif, 'italic'); g.fillStyle = COL.paper;
+  TL.ch.forEach((c, j) => {
+    const p = ease.outCubic(prog(lt, .04 + j * .014, .34 + j * .014));
+    g.globalAlpha = p; g.fillText(c, 194 + TL.xs[j], 330 + (1 - p) * 40);
+  });
+  g.globalAlpha = 1;
+
+  const tq = qt(t);
+  LANES.forEach((ln, li) => {
+    const d = ease.outExpo(prog(lt, .05 + li * .06, .45 + li * .06));
+    // label
+    g.globalAlpha = d; g.fillStyle = COL.paper; g.font = font(20, F.mono);
+    g.fillText(ln.name, 200 - (1 - d) * 40, ln.y + 7);
+    g.globalAlpha = d * .6; g.font = font(15, F.mono);
+    g.fillText(`v = ${laneV(ln.f, tq).toFixed(3)}`, 200, ln.y + 36);
+    // track
+    g.globalAlpha = .4; g.fillStyle = COL.paper;
+    g.fillRect(TX0, ln.y - 1, (TX1 - TX0) * d, 2);
+    g.globalAlpha = .6 * d;
+    g.fillRect(TX0, ln.y - 12, 2, 24); g.fillRect(TX1, ln.y - 12, 2, 24);
+    g.font = font(13, F.mono); g.fillText('0', TX0 - 4, ln.y + 34); g.fillText('1', TX1 - 4, ln.y + 34);
+    // graph box
+    const gy0 = ln.y - GH / 2;
+    g.globalAlpha = .35 * d; g.strokeStyle = COL.paper; g.lineWidth = 1.5;
+    g.strokeRect(GX, gy0, GW * d, GH);
+    g.globalAlpha = .12 * d;
+    for (let k = 1; k < 4; k++) g.fillRect(GX + GW * k / 4, gy0, 1, GH);
+    const gpt = u => [GX + u * GW, gy0 + GH - ln.f(u) * GH];
+    // faint full curve
+    g.globalAlpha = .22 * d; g.lineWidth = 2; g.beginPath();
+    for (let s = 0; s <= 80; s++) { const [px, py] = gpt(s / 80); s ? g.lineTo(px, py) : g.moveTo(px, py); }
+    g.stroke();
+    // live curve
+    const [u1, u2] = laneU(t);
+    const uu = u2 > 0 ? u2 : u1;
+    g.globalAlpha = 1; g.strokeStyle = COL.lime; g.lineWidth = 3; g.beginPath();
+    const steps = Math.max(1, Math.ceil(uu * 80));
+    for (let s = 0; s <= steps; s++) { const [px, py] = gpt(Math.min(uu, s / 80)); s ? g.lineTo(px, py) : g.moveTo(px, py); }
+    if (uu > 0) g.stroke();
+    const [hx, hy] = gpt(uu);
+    if (uu > 0 && uu < 1) {
+      g.globalAlpha = .5; g.fillStyle = COL.lime; g.fillRect(hx, gy0 - 8, 1.5, GH + 16);
+      g.globalAlpha = 1; g.beginPath(); g.arc(hx, hy, 6, 0, TAU); g.fill();
+    }
+    // onion skins + ball
+    for (let k = 6; k >= 1; k--) {
+      const tk = t - k * .03;
+      if (tk < 9.3) continue;
+      const bx = lerp(TX0, TX1, laneV(ln.f, tk));
+      g.globalAlpha = .45 * (1 - k / 7); g.strokeStyle = ln.col; g.lineWidth = 2;
+      g.beginPath(); g.arc(bx, ln.y, 24, 0, TAU); g.stroke();
+    }
+    g.globalAlpha = d; g.fillStyle = ln.col;
+    g.beginPath(); g.arc(lerp(TX0, TX1, laneV(ln.f, t)), ln.y, 24 * d, 0, TAU); g.fill();
+    g.globalAlpha = 1;
+  });
+}
+
+/* ======================================================================
+   SCENE 6 (11–13s) — CUTS. Eight micro-pieces, a quarter second each.
+   ====================================================================== */
+function mBurst(g, p) {
+  g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+  g.save(); g.translate(CX, CY); g.rotate(p * .4);
+  g.strokeStyle = COL.lime; g.lineWidth = 9; g.lineCap = 'round';
+  const r0 = 70 + 820 * ease.outExpo(p), len = 300 * (1 - p) + 30;
+  for (let i = 0; i < 56; i++) {
+    const a = i / 56 * TAU, rr = r0 * (i % 2 ? .82 : 1);
+    g.beginPath(); g.moveTo(Math.cos(a) * rr, Math.sin(a) * rr); g.lineTo(Math.cos(a) * (rr + len), Math.sin(a) * (rr + len)); g.stroke();
+  }
+  g.strokeStyle = COL.red; g.lineWidth = 22 * (1 - p) + 4;
+  g.beginPath(); g.arc(0, 0, 40 + 300 * ease.outExpo(p), 0, TAU); g.stroke();
+  g.restore();
+}
+function mRings(g, p) {
+  g.fillStyle = COL.paper; g.fillRect(0, 0, W, H);
+  g.strokeStyle = COL.red; g.lineWidth = 30;
+  for (let i = 0; i < 15; i++) { const r = (i + p * 2.2) * 82; g.beginPath(); g.arc(CX, CY, r, 0, TAU); g.stroke(); }
+  g.fillStyle = COL.ink; g.beginPath(); g.arc(CX, CY, 46 + 20 * Math.sin(p * TAU * 2), 0, TAU); g.fill();
+}
+function mHalftone(g, p) {
+  g.fillStyle = COL.lime; g.fillRect(0, 0, W, H);
+  g.fillStyle = COL.ink;
+  for (let y = 20; y < H; y += 40) for (let x = 20; x < W; x += 40) {
+    const d = Math.hypot(x - CX * .6, y - CY * 1.4);
+    const r = 2 + 16 * (.5 + .5 * Math.sin(d * .016 - p * 15));
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  }
+}
+function mStripes(g, p) {
+  g.fillStyle = COL.blue; g.fillRect(0, 0, W, H);
+  g.save(); g.translate(CX, CY); g.rotate(-Math.PI / 4);
+  g.fillStyle = COL.paper; const off = (p * 720) % 120;
+  for (let x = -1700; x < 1700; x += 120) g.fillRect(x + off, -1300, 56, 2600);
+  g.restore();
+  const s = 1 + .1 * ease.outCubic(p), L = layout('KINETIC', 290, F.display);
+  g.save(); g.translate(CX, CY); g.scale(s, s);
+  g.font = font(290, F.display); g.textAlign = 'center';
+  g.lineWidth = 26; g.strokeStyle = COL.blue; g.lineJoin = 'round'; g.strokeText('KINETIC', 0, L.capH / 2);
+  g.fillStyle = COL.ink; g.fillText('KINETIC', 0, L.capH / 2);
+  g.restore();
+}
+function mCounter(g, p) {
+  g.fillStyle = COL.red; g.fillRect(0, 0, W, H);
+  const digits = [2, 0, 2, 6], size = 460, lh = size * .95, slot = 330, L = layout('0', size, F.display);
+  g.font = font(size, F.display); g.textAlign = 'center'; g.fillStyle = COL.ink;
+  digits.forEach((dg, k) => {
+    const e = ease.outExpo(clamp((p + .1 - k * .07) / .72));
+    const v = dg + (14 + 7 * k) * (1 - e), fl = Math.floor(v), fr = v - fl;
+    const x = CX + (k - 1.5) * slot;
+    g.save(); g.beginPath(); g.rect(x - slot / 2, CY - lh * .44, slot, lh * .88); g.clip();
+    g.fillText(String(fl % 10), x, CY + L.capH / 2 + fr * lh);
+    g.fillText(String((fl + 1) % 10), x, CY + L.capH / 2 + (fr - 1) * lh);
+    g.restore();
+  });
+  g.fillStyle = COL.ink; g.font = font(20, F.mono);
+  g.fillText('VOL. 2026 — SELECTED WORK', CX, CY + lh * .44 + 60);
+}
+function mSpiral(g, p) {
+  g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+  g.save(); g.translate(CX, CY); g.lineWidth = 5;
+  for (let i = 0; i < 32; i++) {
+    const s = 1700 * .885 ** i;
+    g.save(); g.rotate(i * .07 * (1 + 2.5 * ease.outCubic(p)) + p * .7);
+    g.strokeStyle = i % 3 === 0 ? COL.red : COL.paper; g.strokeRect(-s / 2, -s / 2, s, s); g.restore();
+  }
+  g.restore();
+}
+function mGlitch(g, p, t) {
+  const fi = Math.floor(t * FPS + 1e-6), r = rng(fi * 7919 + 13);
+  ag.globalCompositeOperation = 'source-over'; ag.fillStyle = COL.ink; ag.fillRect(0, 0, W, H);
+  const gs = Math.floor(100 * 1500 / layout('SHOWREEL', 100, F.display).w);
+  const L = layout('SHOWREEL', gs, F.display), s = 1 + .06 * (1 - p), dx = 6 + 22 * r();
+  ag.save(); ag.translate(CX, CY); ag.scale(s, s);
+  ag.font = font(gs, F.display); ag.textAlign = 'center'; ag.globalCompositeOperation = 'lighter';
+  ag.fillStyle = '#FF2A3C'; ag.fillText('SHOWREEL', -dx, L.capH / 2);
+  ag.fillStyle = '#00E5FF'; ag.fillText('SHOWREEL', dx, L.capH / 2);
+  ag.restore(); ag.globalCompositeOperation = 'source-over';
+  const n = 18, sh = H / n;
+  for (let k = 0; k < n; k++) {
+    const off = r() < .35 ? (r() - .5) * 220 : 0;
+    g.drawImage(auxCv, 0, k * sh, W, sh, off, k * sh, W, sh);
+  }
+  g.globalCompositeOperation = 'difference'; g.fillStyle = COL.paper;
+  for (let k = 0; k < 3; k++) if (r() < .6) g.fillRect(r() * W, r() * H, 80 + r() * 500, 6 + r() * 40);
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = .1; g.fillStyle = '#000';
+  for (let y = 0; y < H; y += 4) g.fillRect(0, y, W, 2);
+  g.globalAlpha = 1;
+}
+function mChecker(g, p) {
+  g.fillStyle = COL.ink; g.fillRect(0, 0, W, H);
+  for (let j = 0; j < GR; j++) for (let i = 0; i < GC; i++) {
+    const dl = (i + j) / (GC + GR - 2) * .5;
+    const f = ease.inOutCubic(clamp((p - dl) / .42));
+    const sy = Math.abs(Math.cos(Math.PI * f));
+    g.fillStyle = f < .5 ? ((i + j) % 2 ? COL.red : COL.ink) : COL.paper;
+    if (f < .5 && (i + j) % 2 === 0) g.fillStyle = '#16161B';
+    g.fillRect(i * CELL - .5, (j + .5) * CELL - (CELL + 1) * sy / 2, CELL + 1, (CELL + 1) * sy);
+  }
+}
+const MONTAGE = [mBurst, mRings, mHalftone, mStripes, mCounter, mSpiral, mGlitch, mChecker];
+function S6(g, t) {
+  const m = Math.min(7, Math.floor((t - 11) / .25)), p = (t - 11 - m * .25) / .25;
+  MONTAGE[m](g, clamp(p), t);
+}
+
+/* ======================================================================
+   SCENE 7 (13–15s) — IDENTITY. The wordmark lands; the opening ball
+   returns as the full stop.
+   ====================================================================== */
+const S7C = (() => ({}))();
+function s7Layout() {
+  if (S7C.L) return S7C;
+  const size = 300, L = layout('CLAUDE', size, F.display);
+  const dotR = size * .1, gap = size * .07, blockW = L.w + gap + dotR * 2;
+  Object.assign(S7C, { size, L, dotR, gap, blockW, x0: CX - blockW / 2, base: CY + L.capH / 2 - 50 });
+  S7C.dotX = S7C.x0 + L.w + gap + dotR;
+  S7C.trk = { t0: 13.38, y0: -120, ground: S7C.base - dotR, imps: [13.75, 13.95, 14.05], g: 9600 };
+  return S7C;
+}
+function dot7(t) {
+  const c = s7Layout(), tr = track(t, c.trk);
+  let sy = 1 + clamp(Math.abs(tr.vy) / 5200, 0, .34), y = tr.y;
+  const q = impactSquash(t, c.trk.imps, [1, .5, .25], .05);
+  if (tr.rest) sy = 1;
+  if (q > .03) sy = 1 - .5 * q;
+  y = Math.min(y, c.base - c.dotR * sy);
+  let s = 1;
+  s += .26 * Math.sin(Math.PI * prog(t, 14.42, 14.56)) + .14 * Math.sin(Math.PI * prog(t, 14.6, 14.72));
+  return { y, sx: s / sy, sy: s * sy };
+}
+function S7(g, t) {
+  const c = s7Layout(), lt = t - 13;
+  g.fillStyle = COL.paper; g.fillRect(0, 0, W, H);
+  // kicker
+  const ka = ease.outCubic(prog(lt, .95, 1.25));
+  g.globalAlpha = ka; g.font = font(18, F.mono); g.fillStyle = COL.ink; g.textAlign = 'left';
+  const ky = c.base - c.L.capH - 54;
+  g.fillText('AVAILABLE FOR WORK', c.x0 + 26, ky + (1 - ka) * 14);
+  g.fillStyle = COL.red; g.globalAlpha = ka * (.55 + .45 * Math.cos(qt(t) * 7));
+  g.beginPath(); g.arc(c.x0 + 8, ky - 6 + (1 - ka) * 14, 7, 0, TAU); g.fill();
+  g.globalAlpha = 1;
+  // wordmark
+  g.save(); g.beginPath(); g.rect(0, c.base - c.L.capH - 40, W, c.L.capH + 52); g.clip();
+  g.font = font(c.size, F.display); g.fillStyle = COL.ink;
+  c.L.ch.forEach((ch, j) => {
+    const p = ease.outExpo(prog(lt, j * .048, j * .048 + .55));
+    g.save(); g.translate(c.x0 + c.L.xs[j], c.base + (1 - p) * c.size * 1.05); g.rotate((1 - p) * .18);
+    g.fillText(ch, 0, 0); g.restore();
+  });
+  g.restore();
+  // full-stop ball with onion skins
+  for (let k = 6; k >= 1; k--) {
+    const tk = t - k * .028;
+    if (tk < 13.4 || tk > 14.1) continue;
+    const d = dot7(tk);
+    g.save(); g.globalAlpha = .4 * (1 - k / 7); g.strokeStyle = COL.ink; g.lineWidth = 2;
+    g.translate(c.dotX, d.y); g.scale(d.sx, d.sy); g.beginPath(); g.arc(0, 0, c.dotR, 0, TAU); g.restore(); g.stroke();
+  }
+  if (t >= c.trk.t0) {
+    const d = dot7(t);
+    g.save(); g.translate(c.dotX, d.y); g.scale(d.sx, d.sy);
+    g.fillStyle = COL.red; g.beginPath(); g.arc(0, 0, c.dotR, 0, TAU); g.fill(); g.restore();
+  }
+  // rule
+  const rw = ease.outExpo(prog(lt, .4, 1.0));
+  g.fillStyle = COL.ink; g.fillRect(c.x0, c.base + 58, c.blockW * rw, 3);
+  // sub lines
+  const a1 = ease.outCubic(prog(lt, .6, 1.0));
+  g.globalAlpha = a1; g.font = font(84, F.serif, 'italic'); g.textAlign = 'left';
+  g.fillText('Motion Designer', c.x0 - 4, c.base + 158 + (1 - a1) * 30);
+  g.textAlign = 'right'; g.font = font(18, F.mono);
+  const a2 = ease.outCubic(prog(lt, .72, 1.05)), a3 = ease.outCubic(prog(lt, .82, 1.15));
+  g.globalAlpha = a2; g.fillText('SHOWREEL — 2026', c.x0 + c.blockW, c.base + 112 + (1 - a2) * 16);
+  g.globalAlpha = a3 * .65; g.fillText('TYPE · SYSTEMS · TIMING · CRAFT', c.x0 + c.blockW, c.base + 142 + (1 - a3) * 16);
+  g.globalAlpha = 1; g.textAlign = 'left';
+}
+
+/* ---------- scene dispatch ---------- */
+function drawScene(g, t) {
+  g.save();
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+  if (t < 2) S1(g, t);
+  else if (t < 4) S2(g, t);
+  else if (t < 6) S3(g, t);
+  else if (t < 9) S4(g, t);
+  else if (t < 11) S5(g, t);
+  else if (t < 13) S6(g, t);
+  else S7(g, t);
+  g.restore();
+}
+
+/* ---------- HUD ---------- */
+const SCENES = [
+  [0, '01  SQUASH & STRETCH'], [2, '02  KINETIC TYPE'], [4, '03  SYSTEMS'], [6, '04  PARTICLES'],
+  [9, '05  TIMING'], [11, '06  CUTS'], [13, '07  IDENTITY'],
+];
+function hudColor(t) {
+  if (t < 1.9) return COL.paper;
+  if (t < 2) return COL.ink;
+  if (t < 4) return [COL.ink, COL.paper, COL.ink, COL.paper][Math.min(3, Math.floor((t - 2) / .5))];
+  if (t < 5.98) return COL.ink;
+  if (t < 11) return COL.paper;
+  if (t < 13) {
+    const m = Math.min(7, Math.floor((t - 11) / .25)), p = (t - 11 - m * .25) / .25;
+    if (m === 7) return p > .6 ? COL.ink : COL.paper;
+    return [COL.paper, COL.ink, COL.ink, COL.paper, COL.ink, COL.paper, COL.paper][m];
+  }
+  return COL.ink;
+}
+function hud(g, t) {
+  const c = hudColor(t), a = ease.outCubic(prog(t, .05, .45));
+  g.save(); g.globalAlpha = a; g.fillStyle = c; g.strokeStyle = c;
+  // crop marks
+  const m = 44, l = 26;
+  [[m, m, 1, 1], [W - m, m, -1, 1], [m, H - m, 1, -1], [W - m, H - m, -1, -1]].forEach(([x, y, sx, sy]) => {
+    g.fillRect(x, y, l * sx, 2 * sy); g.fillRect(x, y, 2 * sx, l * sy);
+  });
+  g.font = font(17, F.mono); g.textBaseline = 'alphabetic';
+  g.textAlign = 'left'; g.fillText('MOTION REEL ’26', 88, 92);
+  g.globalAlpha = a * .55; g.fillText('1920×1080 · 60P', 88, 116); g.globalAlpha = a;
+  const fi = Math.round(t * FPS), ss = Math.floor(fi / FPS), ff = fi % FPS;
+  g.textAlign = 'right';
+  g.fillText(`TC 00:00:${String(ss).padStart(2, '0')}:${String(ff).padStart(2, '0')}`, W - 88, 92);
+  g.globalAlpha = a * .55; g.fillText('120 BPM', W - 88, 116); g.globalAlpha = a;
+  // scene label with roll transition
+  let si = 0; for (let i = 0; i < SCENES.length; i++) if (t >= SCENES[i][0]) si = i;
+  const ls = ease.outExpo(prog(t, SCENES[si][0], SCENES[si][0] + .3));
+  g.textAlign = 'left';
+  g.save(); g.beginPath(); g.rect(80, H - 112, 600, 30); g.clip();
+  if (si > 0 && ls < 1) g.fillText(SCENES[si - 1][1], 88, H - 90 - ls * 28);
+  g.fillText(SCENES[si][1], 88, H - 90 + (1 - ls) * 28);
+  g.restore();
+  // progress bar
+  const bx = W - 88 - 320, by = H - 98;
+  g.globalAlpha = a * .3; g.fillRect(bx, by, 320, 2);
+  g.globalAlpha = a; g.fillRect(bx, by, 320 * clamp(t / DUR), 2);
+  SCENES.forEach(([s]) => g.fillRect(bx + 320 * s / DUR, by - 5, 2, 12));
+  g.fillRect(bx + 318, by - 5, 2, 12);
+  g.restore();
+}
+
+/* ---------- post: grain + vignette ---------- */
+const grains = [];
+function initGrain() {
+  const r = rng(99);
+  for (let k = 0; k < 4; k++) {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const x = c.getContext('2d'), id = x.createImageData(256, 256);
+    for (let i = 0; i < id.data.length; i += 4) { const v = 128 + (r() - .5) * 255; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+    x.putImageData(id, 0, 0); grains.push(c);
+  }
+}
+let vignette;
+function post(g, t) {
+  const fi = Math.round(t * FPS), r = rng(fi + 1);
+  g.save(); g.globalCompositeOperation = 'overlay'; g.globalAlpha = .07;
+  g.translate(-Math.floor(r() * 256), -Math.floor(r() * 256));
+  g.fillStyle = g.createPattern(grains[fi % 4], 'repeat'); g.fillRect(0, 0, W + 256, H + 256);
+  g.restore();
+  if (!vignette) {
+    vignette = g.createRadialGradient(CX, CY, 520, CX, CY, 1180);
+    vignette.addColorStop(0, 'rgba(0,0,0,0)'); vignette.addColorStop(1, 'rgba(0,0,0,0.13)');
+  }
+  g.fillStyle = vignette; g.fillRect(0, 0, W, H);
+}
+
+/* ---------- camera shake on the big hits ---------- */
+const HITS = [[.5, .5], [2.0, 1], [4.0, .5], [6.0, 1], [8.0, .7], [11.0, .6], [13.0, 1]];
+function shake(t) {
+  let a = 0;
+  for (const [ht, s] of HITS) { const d = t - ht; if (d >= 0 && d < .3) a += s * (1 - d / .3) ** 2; }
+  if (a <= 0) return [0, 0, 0];
+  const ox = (Math.sin(t * 97) + Math.sin(t * 151) * .6) * 9 * a, oy = (Math.cos(t * 83) + Math.sin(t * 131) * .6) * 9 * a;
+  return [ox, oy, .025 * a];
+}
+
+/* ---------- frame render with accumulation motion blur ---------- */
+function renderAt(t0, samples) {
+  const shutter = .5 / FPS; // 180° shutter
+  out.globalCompositeOperation = 'source-over';
+  for (let s = 0; s < samples; s++) {
+    const t = clamp(t0 + (s / samples) * shutter, 0, DUR - 1e-4); // trailing shutter: on-frame cuts stay clean
+    drawScene(sg, t);
+    out.globalAlpha = 1 / (s + 1);
+    const [ox, oy, e] = shake(t);
+    out.drawImage(sceneCv, ox - W * e / 2, oy - H * e / 2, W * (1 + e), H * (1 + e));
+  }
+  out.globalAlpha = 1;
+  post(out, t0);
+  hud(out, t0);
+}
+window.renderFrame = (fi, samples = 6) => { renderAt(fi / FPS, samples); return true; };
+
+window.READY = (async () => {
+  await Promise.all([
+    document.fonts.load('100px "Archivo Black"'), document.fonts.load('100px "JetBrains Mono"'),
+    document.fonts.load('italic 100px "Instrument Serif"'), document.fonts.load('500 100px "Space Grotesk"'),
+  ]);
+  initGrain(); initParticles(); s7Layout();
+  return true;
+})();
+
+// Live preview when opened directly (no ?render): loops in real time.
+if (!/render/.test(location.search)) {
+  window.READY.then(() => {
+    const m = location.search.match(/t=([\d.]+)/);
+    let start = performance.now() - (m ? +m[1] * 1000 : 0), paused = false, pt = 0;
+    cv.addEventListener('click', () => { paused = !paused; if (!paused) start = performance.now() - pt * 1000; });
+    (function loop(now) {
+      if (!paused) { pt = ((now - start) / 1000) % DUR; renderAt(pt, 1); }
+      requestAnimationFrame(loop);
+    })(performance.now());
+  });
+}
+</script>
+</body>
+</html>
